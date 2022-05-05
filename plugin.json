@@ -2,7 +2,7 @@
     "name": "Hubspot",
     "url": "https://github.com/PostHog/hubspot-plugin",
     "description": "Send contact data to Hubspot on PostHog identify events.",
-    "main": "index.js",
+    "main": "index.ts",
     "config": [
         {
             "key": "hubspotApiKey",
@@ -62,6 +62,6 @@
         }
     ],
     "publicJobs": {
-      "Clear storage": {}
+        "Clear storage": {}
     }
 }

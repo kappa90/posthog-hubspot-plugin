@@ -1,20 +1,82 @@
+import { CacheExtension, Plugin, PluginMeta } from '@posthog/plugin-scaffold'
+import fetch, { Response } from 'node-fetch'
+
 const NEXT_CONTACT_BATCH_KEY = 'next_hubspot_contacts_url'
 const SYNC_LAST_COMPLETED_DATE_KEY = 'last_job_complete_day'
 
-export const jobs = {
-   'Clear storage': async (_, { storage }) => {
-       await storage.del(NEXT_CONTACT_BATCH_KEY)
-       await storage.del(SYNC_LAST_COMPLETED_DATE_KEY)
-   }
+declare const posthog: {
+    capture: (_: string, props?: Record<string, unknown>) => void
+    api: {
+        post: (
+            endpoint: string,
+            options: {
+                data: Record<string, unknown>
+            }
+        ) => Promise<void>
+    }
 }
 
-export async function setupPlugin({ config, global }) {
+type HubspotPlugin = Plugin<{
+    global: {
+        hubspotAuth: string
+        posthogUrl: string
+        apiToken: string
+        projectToken: string
+        syncScoresIntoPosthog: boolean
+    }
+    config: {
+        hubspotApiKey: string
+        postHogUrl: string
+        postHogApiToken: string
+        postHogProjectToken: string
+        triggeringEvents: string
+        ignoredEmails: string
+        additionalPropertyMappings: string
+    }
+    cache: CacheExtension
+}>
+
+type HubspotMeta = PluginMeta<HubspotPlugin>
+
+interface PosthogEvent {
+    event: string
+    distinct_id: string
+    $set: {
+        email: string
+    } & Record<string, string | number>
+    properties: {
+        email: string
+    } & Record<string, string | number>
+    timestamp: string
+    sent_at: string
+}
+
+interface HubspotContact {
+    properties: {
+        email: string
+        hubspotscore: string
+    }
+}
+
+interface Contact {
+    email: string
+    score: string
+}
+
+export const jobs = {
+    clearStorage: async ({}: Record<string, unknown>, { cache }: HubspotMeta): Promise<void> => {
+        await cache.expire(NEXT_CONTACT_BATCH_KEY, 0)
+        await cache.expire(SYNC_LAST_COMPLETED_DATE_KEY, 0)
+    },
+}
+
+export async function setupPlugin({ config, global, jobs }: HubspotMeta): Promise<void> {
     global.hubspotAuth = `hapikey=${config.hubspotApiKey}`
     global.posthogUrl = config.postHogUrl
     global.apiToken = config.postHogApiToken
     global.projectToken = config.postHogProjectToken
 
-    global.syncScoresIntoPosthog = global.posthogUrl && global.apiToken && global.projectToken
+    global.syncScoresIntoPosthog = !!(global.posthogUrl && global.apiToken && global.projectToken)
 
     const authResponse = await fetchWithRetry(
         `https://api.hubapi.com/crm/v3/objects/contacts?limit=1&paginateAssociations=false&archived=false&${global.hubspotAuth}`
@@ -23,9 +85,10 @@ export async function setupPlugin({ config, global }) {
     if (!statusOk(authResponse)) {
         throw new Error('Unable to connect to Hubspot. Please make sure your API key is correct.')
     }
+    jobs.clearStorage({}).runNow()
 }
 
-async function updateHubspotScore(email, hubspotScore, global) {
+async function updateHubspotScore(email: string, hubspotScore: string, global: HubspotMeta['global']) {
     let updated = false
     const _userRes = await fetch(`${global.posthogUrl}/api/person/?token=${global.projectToken}&email=${email}`, {
         method: 'GET',
@@ -40,20 +103,17 @@ async function updateHubspotScore(email, hubspotScore, global) {
             const updatedProps = { hubspot_score: parseInt(hubspotScore, 10), ...currentProps }
 
             if (userId) {
-                const _updateRes = await fetch(
-                    `${global.posthogUrl}/api/person/${userId}/?token=${global.projectToken}`,
-                    {
-                        method: 'PATCH',
-                        headers: {
-                            Authorization: `Bearer ${global.apiToken}`,
-                            Accept: 'application/json',
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            properties: updatedProps,
-                        }),
-                    }
-                )
+                await fetch(`${global.posthogUrl}/api/person/${userId}/?token=${global.projectToken}`, {
+                    method: 'PATCH',
+                    headers: {
+                        Authorization: `Bearer ${global.apiToken}`,
+                        Accept: 'application/json',
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        properties: updatedProps,
+                    }),
+                })
                 updated = true
             }
         }
@@ -62,13 +122,13 @@ async function updateHubspotScore(email, hubspotScore, global) {
     return updated
 }
 
-async function getHubspotContacts(global, storage) {
+async function getHubspotContacts(global: HubspotMeta['global'], cache: CacheExtension) {
     console.log('Loading Hubspot Contacts...')
     const properties = ['email', 'hubspotscore']
 
-    let requestUrl = await storage.get(NEXT_CONTACT_BATCH_KEY)
+    let requestUrl = (await cache.get(NEXT_CONTACT_BATCH_KEY, null)) as string | null
     if (!requestUrl) {
-        const lastFinishDate = await storage.get(SYNC_LAST_COMPLETED_DATE_KEY)
+        const lastFinishDate = await cache.get(SYNC_LAST_COMPLETED_DATE_KEY, null)
         const dateObj = new Date()
         const todayStr = `${dateObj.getUTCFullYear()}-${dateObj.getUTCMonth()}-${dateObj.getUTCDate()}`
         if (todayStr === lastFinishDate) {
@@ -81,7 +141,7 @@ async function getHubspotContacts(global, storage) {
         }&properties=${properties.join(',')}`
     }
 
-    const loadedContacts = []
+    const loadedContacts: Contact[] = []
     const authResponse = await fetchWithRetry(requestUrl)
     const res = await authResponse.json()
 
@@ -93,7 +153,7 @@ async function getHubspotContacts(global, storage) {
     }
 
     if (res && res['results']) {
-        res['results'].forEach((hubspotContact) => {
+        res['results'].forEach((hubspotContact: HubspotContact) => {
             const props = hubspotContact['properties']
             loadedContacts.push({ email: props['email'], score: props['hubspotscore'] })
         })
@@ -104,12 +164,12 @@ async function getHubspotContacts(global, storage) {
         ? (nextContactBatch = res['paging']['next']['link'] + `&${global.hubspotAuth}`)
         : null
 
-    await storage.set(NEXT_CONTACT_BATCH_KEY, nextContactBatch)
+    await cache.set(NEXT_CONTACT_BATCH_KEY, nextContactBatch)
     console.log(`Loaded ${loadedContacts.length} Contacts from Hubspot`)
     return loadedContacts
 }
 
-export async function runEveryMinute({ config, global, storage }) {
+export async function runEveryMinute({ global, cache }: HubspotMeta): Promise<void> {
     console.log('Starting score sync job...')
     posthog.capture('hubspot score sync started')
 
@@ -117,7 +177,7 @@ export async function runEveryMinute({ config, global, storage }) {
         console.log('Not syncing Hubspot Scores into PostHog - config not set.')
     }
 
-    const loadedContacts = await getHubspotContacts(global, storage)
+    const loadedContacts = await getHubspotContacts(global, cache)
     let skipped = 0
     let num_updated = 0
     let num_processed = 0
@@ -136,6 +196,7 @@ export async function runEveryMinute({ config, global, storage }) {
                 skipped += 1
             }
         } catch (error) {
+            console.error(error)
             console.log(`Error updating Hubspot score for ${email} - Skipping`)
             num_errors += 1
         }
@@ -145,11 +206,11 @@ export async function runEveryMinute({ config, global, storage }) {
     console.log(
         `Successfully updated Hubspot scores for ${num_updated} records, skipped ${skipped} records, processed ${loadedContacts.length} Hubspot Contacts, errors: ${num_errors} `
     )
-    const nextContactBatch = await storage.get(NEXT_CONTACT_BATCH_KEY)
+    const nextContactBatch = await cache.get(NEXT_CONTACT_BATCH_KEY, null)
     if (!nextContactBatch) {
         posthog.capture('hubspot contact sync all contacts completed', { num_updated: num_updated })
         const dateObj = new Date()
-        await storage.set(
+        await cache.set(
             SYNC_LAST_COMPLETED_DATE_KEY,
             `${dateObj.getUTCFullYear()}-${dateObj.getUTCMonth()}-${dateObj.getUTCDate()}`
         )
@@ -158,7 +219,7 @@ export async function runEveryMinute({ config, global, storage }) {
     }
 }
 
-export async function onEvent(event, { config, global }) {
+export async function onEvent(event: PosthogEvent, { config, global }: HubspotMeta): Promise<void> {
     const triggeringEvents = (config.triggeringEvents || '').split(',')
     if (triggeringEvents.indexOf(event.event) >= 0) {
         const email = getEmailFromEvent(event)
@@ -181,8 +242,14 @@ export async function onEvent(event, { config, global }) {
     }
 }
 
-async function createHubspotContact(email, properties, authQs, additionalPropertyMappings, eventSendTime) {
-    let hubspotFilteredProps = {}
+async function createHubspotContact(
+    email: string,
+    properties: Record<string, string | number>,
+    authQs: string,
+    additionalPropertyMappings: string,
+    eventSendTime: string
+) {
+    const hubspotFilteredProps: Record<string, string | number> = {}
     for (const [key, val] of Object.entries(properties)) {
         if (hubspotPropsMap[key]) {
             hubspotFilteredProps[hubspotPropsMap[key]] = val
@@ -190,7 +257,7 @@ async function createHubspotContact(email, properties, authQs, additionalPropert
     }
 
     if (additionalPropertyMappings) {
-        for (let mapping of additionalPropertyMappings.split(',')) {
+        for (const mapping of additionalPropertyMappings.split(',')) {
             const [postHogProperty, hubSpotProperty] = mapping.split(':')
             if (postHogProperty && hubSpotProperty) {
                 // special case to convert an event's timestamp to the format Hubspot uses them
@@ -254,7 +321,7 @@ async function createHubspotContact(email, properties, authQs, additionalPropert
     }
 }
 
-async function fetchWithRetry(url, options = {}, method = 'GET', isRetry = false) {
+async function fetchWithRetry(url: string, options = {}, method = 'GET', isRetry = false): Promise<Response> {
     try {
         const res = await fetch(url, { method: method, ...options })
         return res
@@ -267,17 +334,16 @@ async function fetchWithRetry(url, options = {}, method = 'GET', isRetry = false
     }
 }
 
-function statusOk(res) {
+function statusOk(res: Response) {
     return String(res.status)[0] === '2'
 }
 
-function isEmail(email) {
-    const re =
-        /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
+function isEmail(email: string) {
+    const re = /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
     return re.test(String(email).toLowerCase())
 }
 
-function getEmailFromEvent(event) {
+function getEmailFromEvent(event: PosthogEvent) {
     if (isEmail(event.distinct_id)) {
         return event.distinct_id
     } else if (event['$set'] && Object.keys(event['$set']).includes('email')) {
@@ -293,7 +359,7 @@ function getEmailFromEvent(event) {
     return null
 }
 
-const hubspotPropsMap = {
+const hubspotPropsMap: Record<string, string> = {
     companyName: 'company',
     company_name: 'company',
     company: 'company',
